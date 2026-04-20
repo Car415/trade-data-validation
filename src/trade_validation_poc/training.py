@@ -1,11 +1,17 @@
-from dataclasses import dataclass, field
+import os
 from typing import Dict, Iterable, List, Tuple
 
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 
 def _clip_probability(value: float) -> float:
+    # Prevent exact 0 or 1 before any logit transform. Those values would
+    # create infinities.
     return min(max(value, 1e-5), 1 - 1e-5)
 
 
@@ -19,6 +25,9 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
 
 
 def binary_auc(y_true: pd.Series, y_prob: pd.Series) -> float:
+    # We compute AUC ourselves so the project stays explicit about what the
+    # metric means and avoids pulling in extra metric helpers for one formula.
+    # AUC near 1.0 means the model ranks bad trades above good ones well.
     y_true_values = np.asarray(y_true, dtype=int)
     y_prob_values = np.asarray(y_prob, dtype=float)
 
@@ -31,107 +40,94 @@ def binary_auc(y_true: pd.Series, y_prob: pd.Series) -> float:
     sum_ranks_pos = float(ranks[y_true_values == 1].sum())
     return (sum_ranks_pos - (n_pos * (n_pos + 1) / 2)) / (n_pos * n_neg)
 
+def _prepare_lightgbm_frames(
+    frame: pd.DataFrame,
+    feature_columns: List[str],
+    categorical_columns: List[str],
+) -> pd.DataFrame:
+    # LightGBM can work directly with pandas categorical columns. That is very
+    # useful here because many business fields are strings such as asset class,
+    # source system, or currency.
+    prepared = frame[feature_columns].copy()
+    for column in categorical_columns:
+        prepared[column] = prepared[column].astype("category")
+    return prepared
 
-@dataclass
-class BaselineFieldModel:
-    target_field: str
-    categorical_maps: Dict[str, Dict[object, float]] = field(default_factory=dict)
-    numeric_rules: Dict[str, Tuple[float, float, float]] = field(default_factory=dict)
-    base_logit: float = 0.0
 
-    def fit(self, features: pd.DataFrame, labels: pd.Series) -> "BaselineFieldModel":
-        label_mean = float(labels.mean()) if len(labels) else 0.0
-        self.base_logit = _logit(label_mean if 0 < label_mean < 1 else 0.5)
-
-        for column in features.columns:
-            series = features[column]
-            if pd.api.types.is_numeric_dtype(series):
-                filled = pd.to_numeric(series, errors="coerce")
-                mean = float(filled.mean()) if filled.notna().any() else 0.0
-                std = float(filled.std()) if filled.notna().sum() > 1 else 1.0
-                std = 1.0 if pd.isna(std) or std == 0 else std
-                pos_slice = filled[labels == 1].dropna()
-                neg_slice = filled[labels == 0].dropna()
-                pos_mean = float(pos_slice.mean()) if not pos_slice.empty else mean
-                neg_mean = float(neg_slice.mean()) if not neg_slice.empty else mean
-                coef = float(np.clip((pos_mean - neg_mean) / std, -1.0, 1.0))
-                self.numeric_rules[column] = (mean, std, coef)
-            else:
-                grouped = (
-                    pd.DataFrame({"value": series.astype("object"), "label": labels})
-                    .groupby("value", dropna=False)["label"]
-                    .mean()
-                )
-                self.categorical_maps[column] = {
-                    key: float(np.clip(_logit(rate) - self.base_logit, -1.5, 1.5))
-                    for key, rate in grouped.items()
-                }
-
-        return self
-
-    def predict_proba(self, features: pd.DataFrame) -> np.ndarray:
-        scores = np.full(len(features), self.base_logit, dtype=float)
-        contribution_count = np.zeros(len(features), dtype=float)
-
-        for column, mapping in self.categorical_maps.items():
-            values = features[column].astype("object")
-            scores += values.map(lambda value: mapping.get(value, 0.0)).fillna(0.0).to_numpy(dtype=float)
-            contribution_count += 1
-
-        for column, (mean, std, coef) in self.numeric_rules.items():
-            values = pd.to_numeric(features[column], errors="coerce").fillna(mean)
-            scores += ((values.to_numpy(dtype=float) - mean) / std) * coef
-            contribution_count += 1
-
-        contribution_count = np.where(contribution_count == 0, 1.0, contribution_count)
-        normalized_scores = scores / np.sqrt(contribution_count)
-        probabilities = _sigmoid(normalized_scores)
-        return np.column_stack([1 - probabilities, probabilities])
-
-    def predict(self, features: pd.DataFrame, threshold: float = 0.5) -> np.ndarray:
-        return (self.predict_proba(features)[:, 1] >= threshold).astype(int)
-
-    def feature_importances(self) -> pd.Series:
-        importances: Dict[str, float] = {}
-        for column, mapping in self.categorical_maps.items():
-            importances[column] = max((abs(value) for value in mapping.values()), default=0.0)
-        for column, (_, _, coef) in self.numeric_rules.items():
-            importances[column] = abs(coef)
-        return pd.Series(importances).sort_values(ascending=False)
+def _build_lightgbm_model(seed: int) -> lgb.LGBMClassifier:
+    # These parameters are a practical starting point for a tabular-data POC.
+    # They are not heavily tuned yet; the goal is a stable, readable baseline.
+    return lgb.LGBMClassifier(
+        objective="binary",
+        is_unbalance=True,
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=7,
+        num_leaves=31,
+        min_child_samples=20,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=seed,
+        verbose=-1,
+    )
 
 
 def train_models(
     dataset: pd.DataFrame,
     target_fields: Iterable[str],
     seed: int = 42,
-) -> Tuple[Dict[str, BaselineFieldModel], pd.DataFrame, List[str]]:
+) -> Tuple[Dict[str, lgb.LGBMClassifier], pd.DataFrame, List[str]]:
+    # Every `label_*` column is a training target. Everything else except
+    # `trade_id` is treated as a feature.
     label_columns = [column for column in dataset.columns if column.startswith("label_")]
     feature_columns = [column for column in dataset.columns if column != "trade_id" and column not in label_columns]
-
-    rng = np.random.default_rng(seed)
-    shuffled = dataset.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    split_index = max(1, int(len(shuffled) * 0.8))
-    train_frame = shuffled.iloc[:split_index]
-    test_frame = shuffled.iloc[split_index:]
-    if test_frame.empty:
-        test_frame = train_frame.copy()
-
-    models: Dict[str, BaselineFieldModel] = {}
+    categorical_columns = dataset[feature_columns].select_dtypes(include=["object"]).columns.tolist()
+    models: Dict[str, lgb.LGBMClassifier] = {}
     results = []
 
     for target_field in target_fields:
         label_column = f"label_{target_field}"
-        model = BaselineFieldModel(target_field=target_field).fit(
-            train_frame[feature_columns],
-            train_frame[label_column],
-        )
-        test_prob = model.predict_proba(test_frame[feature_columns])[:, 1]
-        test_pred = (test_prob >= 0.5).astype(int)
-        y_test = test_frame[label_column].astype(int)
+        y = dataset[label_column].astype(int)
 
-        tp = int(((test_pred == 1) & (y_test == 1)).sum())
-        fp = int(((test_pred == 1) & (y_test == 0)).sum())
-        fn = int(((test_pred == 0) & (y_test == 1)).sum())
+        # Stratified splitting helps keep the positive/negative ratio similar in
+        # train and test. We fall back to a normal split if there are too few
+        # positives to stratify safely.
+        stratify = y if y.nunique() > 1 and y.value_counts().min() > 1 else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            dataset[feature_columns],
+            y,
+            test_size=0.2,
+            random_state=seed,
+            stratify=stratify,
+        )
+
+        X_train_prepared = _prepare_lightgbm_frames(X_train, feature_columns, categorical_columns)
+        X_test_prepared = _prepare_lightgbm_frames(X_test, feature_columns, categorical_columns)
+
+        model = _build_lightgbm_model(seed)
+        model.fit(
+            X_train_prepared,
+            y_train,
+            eval_set=[(X_test_prepared, y_test)],
+            categorical_feature=categorical_columns,
+            callbacks=[
+                # Early stopping prevents the model from training forever once
+                # the validation score stops improving.
+                lgb.early_stopping(25, verbose=False),
+                lgb.log_evaluation(0),
+            ],
+        )
+
+        # `predict_proba` returns probabilities, which are more informative than
+        # hard yes/no predictions. We still convert them to 0/1 for precision
+        # and recall using a simple 0.5 threshold in this POC.
+        test_prob = model.predict_proba(X_test_prepared)[:, 1]
+        test_pred = (test_prob >= 0.5).astype(int)
+
+        y_test_values = y_test.to_numpy(dtype=int)
+        tp = int(((test_pred == 1) & (y_test_values == 1)).sum())
+        fp = int(((test_pred == 1) & (y_test_values == 0)).sum())
+        fn = int(((test_pred == 0) & (y_test_values == 1)).sum())
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
 
@@ -143,8 +139,11 @@ def train_models(
                 "precision": precision,
                 "recall": recall,
                 "positive_rate": float(y_test.mean()),
-                "train_size": len(train_frame),
-                "test_size": len(test_frame),
+                "train_size": len(X_train),
+                "test_size": len(X_test),
+                # This is helpful when reading results because it tells us how
+                # long early stopping actually let the model train.
+                "best_iteration": int(model.best_iteration_ or model.n_estimators),
             }
         )
 
@@ -152,15 +151,19 @@ def train_models(
 
 
 def simulate_catch_rates(
-    models: Dict[str, BaselineFieldModel],
+    models: Dict[str, lgb.LGBMClassifier],
     dataset: pd.DataFrame,
     feature_columns: List[str],
     threshold: float = 0.5,
 ) -> pd.DataFrame:
+    # This simulates the business question: "if we ran the model before sending
+    # the submission, how many bad trades would it have flagged?"
+    categorical_columns = dataset[feature_columns].select_dtypes(include=["object"]).columns.tolist()
+    prepared = _prepare_lightgbm_frames(dataset, feature_columns, categorical_columns)
     simulation_rows = []
     for field, model in models.items():
         label_column = f"label_{field}"
-        probabilities = model.predict_proba(dataset[feature_columns])[:, 1]
+        probabilities = model.predict_proba(prepared)[:, 1]
         flagged = probabilities >= threshold
         actual = dataset[label_column].astype(int).to_numpy(dtype=int)
         caught = int(np.logical_and(flagged, actual == 1).sum())

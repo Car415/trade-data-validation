@@ -5,6 +5,9 @@ from typing import Dict, List, Tuple
 import pandas as pd
 
 
+# These templates give us two product families with slightly different field
+# shapes, which mimics the real-world problem where different asset classes
+# produce different keys inside the JSON terms payload.
 ASSET_TEMPLATES = [
     {
         "asset_class": "IR",
@@ -28,6 +31,8 @@ ASSET_TEMPLATES = [
 
 
 def _build_trade_terms(index: int, template: Dict[str, object], rng: random.Random) -> Dict[str, str]:
+    # The real system stores terms as strings, so the mock data does the same.
+    # That lets us test the preprocessing step honestly.
     maturity_year = 2028 + (index % 5)
     notional = template["base_notional"] + (index % 7) * 125_000
     terms = {
@@ -51,6 +56,8 @@ def _build_trade_terms(index: int, template: Dict[str, object], rng: random.Rand
 
 
 def _choose_override_fields(template: Dict[str, object], index: int) -> List[str]:
+    # We rotate through a few correction patterns so the model has something to
+    # learn instead of seeing random noise.
     if template["asset_class"] == "IR":
         patterns = [
             ["notional", "fixed_rate"],
@@ -69,6 +76,9 @@ def _choose_override_fields(template: Dict[str, object], index: int) -> List[str
 
 
 def _mutate_submission_terms(elig_terms: Dict[str, str], override_fields: List[str], index: int) -> Tuple[Dict[str, str], Dict[str, str]]:
+    # `elig_terms` represents the source snapshot and `sub_terms` represents the
+    # "bad" submitted values. The returned `corrected_values` become the nested
+    # payload used to build labels later.
     sub_terms = dict(elig_terms)
     corrected_values: Dict[str, str] = {}
     for field in override_fields:
@@ -92,6 +102,8 @@ def _mutate_submission_terms(elig_terms: Dict[str, str], override_fields: List[s
 
 
 def _build_input_message(trade_id: str, corrected_values: Dict[str, str]) -> str:
+    # This mirrors the nested structure described in the plan, where the
+    # corrected field names live inside `TradeCorrectiveInfo -> CorrectiveMeta`.
     return json.dumps(
         {
             "TradeCorrectiveInfo": [
@@ -109,6 +121,9 @@ def create_mock_datasets(
     non_corrected_count: int = 120,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # We generate two datasets because supervised learning needs both positive
+    # examples (corrected trades) and negative examples (trades that were not
+    # corrected).
     rng = random.Random(seed)
     corrected_rows = []
     non_corrected_rows = []

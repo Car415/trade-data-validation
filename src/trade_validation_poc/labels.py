@@ -6,6 +6,8 @@ import pandas as pd
 
 
 def _extract_overridden_key_sequence(input_message: str) -> List[str]:
+    # `input_message` is nested JSON. We only care about which keys were
+    # overridden, because those keys become our labels: "was this field wrong?"
     if pd.isna(input_message) or not input_message:
         return []
     try:
@@ -22,6 +24,8 @@ def _extract_overridden_key_sequence(input_message: str) -> List[str]:
 
 
 def extract_overridden_keys(input_message: str) -> Set[str]:
+    # Public helper used in tests and debugging when we only need the unique
+    # overridden field names.
     return set(_extract_overridden_key_sequence(input_message))
 
 
@@ -30,6 +34,9 @@ def build_label_frames(
     non_corrected: pd.DataFrame,
     top_n: int = 5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    # We train one binary model per frequently corrected field. For example,
+    # "label_notional = 1" means this trade's notional was overridden in a
+    # MISS_REPORTING correction and should be treated as a positive example.
     corrected = corrected.copy()
     corrected["overridden_key_sequence"] = corrected["input_message"].apply(_extract_overridden_key_sequence)
     corrected["overridden_keys"] = corrected["overridden_key_sequence"].apply(set)
@@ -42,6 +49,9 @@ def build_label_frames(
                 first_seen_order[key] = len(first_seen_order)
         key_counts.update(sequence)
 
+    # When two fields have the same frequency, keeping first-seen order makes
+    # target selection deterministic. That keeps tests stable and results easier
+    # to reason about.
     target_fields = [
         field
         for field, _ in sorted(
@@ -56,6 +66,8 @@ def build_label_frames(
             lambda keys: 1 if field in keys else 0
         )
 
+    # Trades with no corrective report are negative samples for every target
+    # field in this POC.
     labels_non_corrected = pd.DataFrame({"trade_id": non_corrected["trade_id"]})
     for field in target_fields:
         labels_non_corrected[f"label_{field}"] = 0
